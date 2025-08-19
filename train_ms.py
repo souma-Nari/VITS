@@ -1,4 +1,5 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 import json
 import argparse
 import itertools
@@ -50,6 +51,7 @@ def main():
   mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
 
 
+"""
 def run(rank, n_gpus, hps):
   global global_step
   if rank == 0:
@@ -101,12 +103,30 @@ def run(rank, n_gpus, hps):
   net_d = DDP(net_d, device_ids=[rank])
 
   try:
-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
-    global_step = (epoch_str - 1) * len(train_loader)
+      g_path = utils.latest_checkpoint_path(hps.model_dir, "G_*.pth")
+      d_path = utils.latest_checkpoint_path(hps.model_dir, "D_*.pth")
+      if g_path is not None and d_path is not None:
+          _, _, _, epoch_str = utils.load_checkpoint(g_path, net_g, optim_g)
+          _, _, _, epoch_str = utils.load_checkpoint(d_path, net_d, optim_d)
+          global_step = (epoch_str - 1) * len(train_loader)
+      else:
+          raise FileNotFoundError
   except:
-    epoch_str = 1
-    global_step = 0
+      epoch_str = 1
+      global_step = 0
+      # Pretrained Generator のみロード
+      pretrained_path = "pretrained_files/vits/pretrained_vctk.pth"
+      if os.path.exists(pretrained_path):
+          print(f"Loading pretrained model from {pretrained_path}")
+          checkpoint_dict = torch.load(pretrained_path, map_location="cpu")
+          if "model" in checkpoint_dict:
+              net_g.load_state_dict(checkpoint_dict["model"], strict=False)
+          else:
+              net_g.load_state_dict(checkpoint_dict, strict=False)
+          print("Generator loaded. Discriminator will be trained from scratch.")
+      else:
+          print("No pretrained model found. Training all from scratch.")
+
 
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
@@ -120,6 +140,114 @@ def run(rank, n_gpus, hps):
       train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
     scheduler_g.step()
     scheduler_d.step()
+"""
+    
+def run(rank, n_gpus, hps):
+  global global_step
+  if rank == 0:
+    logger = utils.get_logger(hps.model_dir)
+    logger.info(hps)
+    utils.check_git_hash(hps.model_dir)
+    writer = SummaryWriter(log_dir=hps.model_dir)
+    writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
+
+  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+  torch.manual_seed(hps.train.seed)
+  torch.cuda.set_device(rank)
+
+  # データローダーの準備（変更なし）
+  train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps.data)
+  train_sampler = DistributedBucketSampler(
+      train_dataset,
+      hps.train.batch_size,
+      [32,300,400,500,600,700,800,900,1000],
+      num_replicas=n_gpus,
+      rank=rank,
+      shuffle=True)
+  collate_fn = TextAudioSpeakerCollate()
+  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
+      collate_fn=collate_fn, batch_sampler=train_sampler)
+  if rank == 0:
+    eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps.data)
+    eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
+        batch_size=hps.train.batch_size, pin_memory=True,
+        drop_last=False, collate_fn=collate_fn)
+
+  # --- ここからが修正箇所 ---
+
+  # 1. 素のモデルを定義する
+  net_g = SynthesizerTrn(
+      len(symbols),
+      hps.data.filter_length // 2 + 1,
+      hps.train.segment_size // hps.data.hop_length,
+      n_speakers=hps.data.n_speakers,
+      **hps.model).cuda(rank)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+  optim_g = torch.optim.AdamW(
+      net_g.parameters(), 
+      hps.train.learning_rate, 
+      betas=hps.train.betas, 
+      eps=hps.train.eps)
+  optim_d = torch.optim.AdamW(
+      net_d.parameters(),
+      hps.train.learning_rate, 
+      betas=hps.train.betas, 
+      eps=hps.train.eps)
+
+  # 2. 【重要】DDPでラップする前に、事前学習済みGeneratorをロードする
+  #    config.jsonにパスを書くのが望ましいが、ここでは直接記述
+  pretrained_path = "/home/souma/workspace/pretrained_files/vits/pretrained_vctk.pth"
+  if os.path.exists(pretrained_path): # configで制御できるようにする
+      print(f"Loading pretrained Generator from {pretrained_path}")
+      checkpoint_dict = torch.load(pretrained_path, map_location="cpu")
+      
+      # state_dictのキーをDDPの状態に合わせて調整
+      # `module.`プレフィックスがついている場合とついていない場合の両方に対応
+      state_dict = checkpoint_dict.get("model", checkpoint_dict)
+      if hasattr(state_dict, '_metadata'):
+        del state_dict._metadata
+
+      # 既存のモデルのstate_dictとキーを比較し、一致するものだけをロード
+      model_dict = net_g.state_dict()
+      saved_state_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+      #print(saved_state_dict.items())
+      model_dict.update(saved_state_dict)
+      net_g.load_state_dict(model_dict)
+      #print(f"Loaded {len(saved_state_dict)}/{len(model_dict)} layers from pretrained Generator.")
+
+  # 3. モデルをDDPでラップする
+  net_g = DDP(net_g, device_ids=[rank])
+  net_d = DDP(net_d, device_ids=[rank])
+
+  # 4. 学習再開処理（中断したファインチューニングを再開する場合に機能）
+  try:
+    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
+    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
+    global_step = (epoch_str - 1) * len(train_loader)
+    if rank == 0:
+        logger.info(f"Resumed training from epoch {epoch_str}")
+  except:
+    epoch_str = 1
+    global_step = 200000
+    if rank == 0:
+        logger.info("Starting new training...")
+
+  # --- 修正箇所ここまで ---
+
+  scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+  scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
+
+  scaler = GradScaler(enabled=hps.train.fp16_run)
+
+  for epoch in range(epoch_str, hps.train.epochs + 1):
+    if rank==0:
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+    else:
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
+    scheduler_g.step()
+    scheduler_d.step()
+
+
 
 
 def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
