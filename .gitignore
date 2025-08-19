@@ -9,3 +9,15 @@ __pycache__
 build
 *.c
 monotonic_align/monotonic_align
+# Large datasets
+DUMMY2_/
+First_Impression_V2_dataset/
+LJSpeech-1.1/
+VCTK_Corpus/
+VCTK_Corpus2016/
+*.zip
+
+# Audio files
+*.wav
+*.mp3
+*.flac

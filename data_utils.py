@@ -37,11 +37,11 @@ class TextAudioLoader(torch.utils.data.Dataset):
         random.shuffle(self.audiopaths_and_text)
         self._filter()
 
-
+    """
     def _filter(self):
-        """
-        Filter text & store spec lengths
-        """
+        
+        #Filter text & store spec lengths
+        #
         # Store spectrogram lengths for Bucketing
         # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
         # spec_length = wav_length // hop_length
@@ -54,6 +54,32 @@ class TextAudioLoader(torch.utils.data.Dataset):
                 lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
+    """
+    
+    def _filter(self):
+
+        audiopaths_and_text_new = []
+        lengths = []
+
+        for line in self.audiopaths_and_text:
+            # 柔軟に2列 or 3列対応
+            if len(line) == 2:
+                audiopath, text = line
+            elif len(line) == 3:
+                audiopath, _, text = line
+            else:
+                continue  # スキップ
+
+            if self.min_text_len <= len(text) <= self.max_text_len:
+                audiopaths_and_text_new.append([audiopath, text])
+                try:
+                    lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+                except OSError:
+                    continue  # ファイルが存在しない場合などはスキップ
+
+        self.audiopaths_and_text = audiopaths_and_text_new
+        self.lengths = lengths
+
 
     def get_audio_text_pair(self, audiopath_and_text):
         # separate filename and text
