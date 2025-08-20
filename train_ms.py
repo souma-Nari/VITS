@@ -255,6 +255,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
   train_loader, eval_loader = loaders
+
   if writers is not None:
     writer, writer_eval = writers
 
@@ -263,15 +264,23 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
   net_g.train()
   net_d.train()
-  for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, speakers) in enumerate(train_loader):
+  for batch_idx, batch_data in enumerate(train_loader):
+    if len(batch_data) == 8:  # 年齢情報あり
+        x, x_lengths, spec, spec_lengths, y, y_lengths, speakers, ages = batch_data
+    else:  # 年齢情報なし（従来形式）
+        x, x_lengths, spec, spec_lengths, y, y_lengths, speakers = batch_data
+        ages = torch.zeros_like(speakers) + 30  # デフォルト30歳
+    
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
     speakers = speakers.cuda(rank, non_blocking=True)
-
+    ages = ages.cuda(rank, non_blocking=True)
+    
     with autocast(enabled=hps.train.fp16_run):
+        # 🔄 修正：年齢パラメータを追加
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
-      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers)
+      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers, ages)
 
       mel = spec_to_mel_torch(
           spec, 

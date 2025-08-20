@@ -410,6 +410,7 @@ class SynthesizerTrn(nn.Module):
     upsample_initial_channel, 
     upsample_kernel_sizes,
     n_speakers=0,
+    n_ages=0,
     gin_channels=0,
     use_sdp=True,
     **kwargs):
@@ -456,14 +457,32 @@ class SynthesizerTrn(nn.Module):
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-  def forward(self, x, x_lengths, y, y_lengths, sid=None):
+      self.emb_age = nn.Embedding(100, gin_channels)  # 固定サイズ
+    
+    self.n_speakers = n_speakers
+    self.n_ages = n_ages
+
+    
+
+  def forward(self, x, x_lengths, y, y_lengths, sid=None, aid=None):
 
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    if self.n_speakers > 0:
-      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+      
+    g = None
+    if self.n_speakers > 0 and sid is not None:
+        g = self.emb_g(sid).unsqueeze(-1)
+        
+        # 🔄 追加：年齢埋め込み処理
+    if aid is not None:
+        age_emb = self.emb_age(aid).unsqueeze(-1)
     else:
-      g = None
-
+        default_age = torch.zeros_like(sid) + 12
+        age_emb = self.emb_age(default_age).unsqueeze(-1)
+            
+    if g is not None:
+        g = g + age_emb
+    else:
+        g = age_emb
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
     z_p = self.flow(z, y_mask, g=g)
 
@@ -496,17 +515,40 @@ class SynthesizerTrn(nn.Module):
     o = self.dec(z_slice, g=g)
     return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
-  def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+  def infer(self, x, x_lengths, sid=None, aid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    if self.n_speakers > 0:
-      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
-    else:
-      g = None
+    
+    g = None
+    if self.n_speakers > 0 and sid is not None:
+        g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+    
+    # 年齢埋め込み処理を追加
+    if aid is not None:
+        age_clamped = torch.clamp(aid, 18, 80)
+        age_idx = age_clamped - 18
+        age_emb = self.emb_age(age_idx).unsqueeze(-1)
+        
+        if g is not None:
+            g = g + age_emb
+        else:
+            g = age_emb
+    elif hasattr(self, 'emb_age'):
+        # デフォルト年齢: 30歳 (インデックス12)
+        if sid is not None:
+            default_age_idx = torch.full_like(sid, 12)  # 30歳 - 18 = 12
+        else:
+            default_age_idx = torch.tensor([12]).to(x.device)
+        age_emb = self.emb_age(default_age_idx).unsqueeze(-1)
+        
+        if g is not None:
+            g = g + age_emb
+        else:
+            g = age_emb
 
     if self.use_sdp:
-      logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+        logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
     else:
-      logw = self.dp(x, x_mask, g=g)
+        logw = self.dp(x, x_mask, g=g)
     w = torch.exp(logw) * x_mask * length_scale
     w_ceil = torch.ceil(w)
     y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
