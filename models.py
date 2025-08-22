@@ -46,6 +46,8 @@ class StochasticDurationPredictor(nn.Module):
     self.convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
     if gin_channels != 0:
       self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
+    
+    
 
   def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
     x = torch.detach(x)
@@ -458,25 +460,32 @@ class SynthesizerTrn(nn.Module):
 
     # 性別埋め込み層を追加（2つのカテゴリ: 0=男性, 1=女性）
     self.emb_gender = nn.Embedding(2, gin_channels)
+    self.g_proj = nn.Conv1d(2 * gin_channels, gin_channels, 1)
+
+
+  def _build_g_concat(self, B, device, sid=None, gid=None):
+    # 話者埋め込み（なければゼロ）
+    if getattr(self, "n_speakers", 0) > 0 and sid is not None:
+        g_spk = self.emb_g(sid).unsqueeze(-1)                          # [B, gin, 1]
+    else:
+        g_spk = torch.zeros(B, self.gin_channels, 1, device=device)    # [B, gin, 1]
+
+    # 性別埋め込み（デフォルト=0: 男性など、あなたの定義に合わせて）
+    if gid is None:
+        gid = torch.zeros(B, dtype=torch.long, device=device)
+    g_gen = self.emb_gender(gid).unsqueeze(-1)                          # [B, gin, 1]
+
+    # concat -> 1x1 Conv で元の次元へ
+    g_cat = torch.cat([g_spk, g_gen], dim=1)                            # [B, 2*gin, 1]
+    g = self.g_proj(g_cat)                                              # [B, gin, 1]
+    return g
 
   def forward(self, x, x_lengths, y, y_lengths, sid=None, gid=None):
 
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
     
-    g = None
-    # 話者埋め込みの処理
-    if self.n_speakers > 0 and sid is not None:
-        g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
-    
-    # 性別埋め込みを追加（常に処理されるように修正）
-    if gid is not None:
-        gender_emb = self.emb_gender(gid).unsqueeze(-1)
-        g = gender_emb  # 性別埋め込みのみを使用
-    elif g is None:
-        # gidもsidもNoneの場合、デフォルトの性別埋め込みを使用
-        default_gid = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        gender_emb = self.emb_gender(default_gid).unsqueeze(-1)
-        g = gender_emb
+    B = x.size(0)
+    g = self._build_g_concat(B, x.device, sid=sid, gid=gid)
 
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
     z_p = self.flow(z, y_mask, g=g)
@@ -512,20 +521,8 @@ class SynthesizerTrn(nn.Module):
 
   def infer(self, x, x_lengths, sid=None, gid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    
-    g = None
-    if self.n_speakers > 0 and sid is not None:
-        g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
-    
-    # 推論時の性別埋め込み
-    if gid is not None:
-        gender_emb = self.emb_gender(gid).unsqueeze(-1)
-        g = gender_emb  # 性別埋め込みのみを使用
-    elif g is None:
-        # デフォルトの性別埋め込みを使用
-        default_gid = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
-        gender_emb = self.emb_gender(default_gid).unsqueeze(-1)
-        g = gender_emb
+    B = x.size(0)
+    g = self._build_g_concat(B, x.device, sid=sid, gid=gid)
 
     if self.use_sdp:
         logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
