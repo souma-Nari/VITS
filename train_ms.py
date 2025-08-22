@@ -216,8 +216,8 @@ def run(rank, n_gpus, hps):
       #print(f"Loaded {len(saved_state_dict)}/{len(model_dict)} layers from pretrained Generator.")
 
   # 3. モデルをDDPでラップする
-  net_g = DDP(net_g, device_ids=[rank])
-  net_d = DDP(net_d, device_ids=[rank])
+      net_g = DDP(net_g, device_ids=[rank], find_unused_parameters=True)
+      net_d = DDP(net_d, device_ids=[rank], find_unused_parameters=True)
 
   # 4. 学習再開処理（中断したファインチューニングを再開する場合に機能）
   try:
@@ -265,22 +265,21 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
   net_g.train()
   net_d.train()
   for batch_idx, batch_data in enumerate(train_loader):
-    if len(batch_data) == 8:  # 年齢情報あり
-        x, x_lengths, spec, spec_lengths, y, y_lengths, speakers, ages = batch_data
-    else:  # 年齢情報なし（従来形式）
+    # バッチデータの長さに応じて処理を分岐
+    if len(batch_data) == 8:  # 性別情報あり
+        x, x_lengths, spec, spec_lengths, y, y_lengths, speakers, genders = batch_data
+    else:  # 性別情報なし（従来形式）
         x, x_lengths, spec, spec_lengths, y, y_lengths, speakers = batch_data
-        ages = torch.zeros_like(speakers) + 30  # デフォルト30歳
+        genders = torch.zeros_like(speakers)  # デフォルト: 男性
     
     x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(rank, non_blocking=True)
     spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(rank, non_blocking=True)
     y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(rank, non_blocking=True)
     speakers = speakers.cuda(rank, non_blocking=True)
-    ages = ages.cuda(rank, non_blocking=True)
-    
+    genders = genders.cuda(rank, non_blocking=True)
     with autocast(enabled=hps.train.fp16_run):
-        # 🔄 修正：年齢パラメータを追加
       y_hat, l_length, attn, ids_slice, x_mask, z_mask,\
-      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers, ages)
+      (z, z_p, m_p, logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, speakers, genders)
 
       mel = spec_to_mel_torch(
           spec, 
@@ -372,11 +371,19 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
     with torch.no_grad():
-      for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths, speakers) in enumerate(eval_loader):
+      for batch_idx, batch_data in enumerate(eval_loader):
+        # バッチデータの長さに応じて処理を分岐
+        if len(batch_data) == 8:  # 性別情報あり
+            x, x_lengths, spec, spec_lengths, y, y_lengths, speakers, genders = batch_data
+        else:  # 性別情報なし（従来形式）
+            x, x_lengths, spec, spec_lengths, y, y_lengths, speakers = batch_data
+            genders = torch.zeros_like(speakers)  # デフォルト: 男性
+        
         x, x_lengths = x.cuda(0), x_lengths.cuda(0)
         spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
         y, y_lengths = y.cuda(0), y_lengths.cuda(0)
         speakers = speakers.cuda(0)
+        genders = genders.cuda(0)
 
         # remove else
         x = x[:1]
@@ -386,8 +393,18 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         y = y[:1]
         y_lengths = y_lengths[:1]
         speakers = speakers[:1]
+        genders = genders[:1]  # 性別情報も同様にスライス
+
+
+        print(f"[DEBUG] Input shapes before infer:")
+        print(f"  x: {x.shape}")
+        print(f"  x_lengths: {x_lengths.shape}, values: {x_lengths}")
+        print(f"  speakers: {speakers.shape}, values: {speakers}")
+        print(f"  genders: {genders.shape}, values: {genders}")
+
         break
-      y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, speakers, max_len=1000)
+      # 性別情報をinferメソッドに渡す
+      y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, speakers, genders, max_len=1000)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 
       mel = spec_to_mel_torch(

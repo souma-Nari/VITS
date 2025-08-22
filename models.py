@@ -410,7 +410,6 @@ class SynthesizerTrn(nn.Module):
     upsample_initial_channel, 
     upsample_kernel_sizes,
     n_speakers=0,
-    n_ages=0,
     gin_channels=0,
     use_sdp=True,
     **kwargs):
@@ -457,32 +456,28 @@ class SynthesizerTrn(nn.Module):
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-      self.emb_age = nn.Embedding(100, gin_channels)  # 固定サイズ
-    
-    self.n_speakers = n_speakers
-    self.n_ages = n_ages
+    # 性別埋め込み層を追加（2つのカテゴリ: 0=男性, 1=女性）
+    self.emb_gender = nn.Embedding(2, gin_channels)
 
-    
-
-  def forward(self, x, x_lengths, y, y_lengths, sid=None, aid=None):
+  def forward(self, x, x_lengths, y, y_lengths, sid=None, gid=None):
 
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-      
+    
     g = None
+    # 話者埋め込みの処理
     if self.n_speakers > 0 and sid is not None:
-        g = self.emb_g(sid).unsqueeze(-1)
-        
-        # 🔄 追加：年齢埋め込み処理
-    if aid is not None:
-        age_emb = self.emb_age(aid).unsqueeze(-1)
-    else:
-        default_age = torch.zeros_like(sid) + 12
-        age_emb = self.emb_age(default_age).unsqueeze(-1)
-            
-    if g is not None:
-        g = g + age_emb
-    else:
-        g = age_emb
+        g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+    
+    # 性別埋め込みを追加（常に処理されるように修正）
+    if gid is not None:
+        gender_emb = self.emb_gender(gid).unsqueeze(-1)
+        g = gender_emb  # 性別埋め込みのみを使用
+    elif g is None:
+        # gidもsidもNoneの場合、デフォルトの性別埋め込みを使用
+        default_gid = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        gender_emb = self.emb_gender(default_gid).unsqueeze(-1)
+        g = gender_emb
+
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
     z_p = self.flow(z, y_mask, g=g)
 
@@ -515,35 +510,22 @@ class SynthesizerTrn(nn.Module):
     o = self.dec(z_slice, g=g)
     return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 
-  def infer(self, x, x_lengths, sid=None, aid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+  def infer(self, x, x_lengths, sid=None, gid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
     
     g = None
     if self.n_speakers > 0 and sid is not None:
         g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
     
-    # 年齢埋め込み処理を追加
-    if aid is not None:
-        age_clamped = torch.clamp(aid, 18, 80)
-        age_idx = age_clamped - 18
-        age_emb = self.emb_age(age_idx).unsqueeze(-1)
-        
-        if g is not None:
-            g = g + age_emb
-        else:
-            g = age_emb
-    elif hasattr(self, 'emb_age'):
-        # デフォルト年齢: 30歳 (インデックス12)
-        if sid is not None:
-            default_age_idx = torch.full_like(sid, 12)  # 30歳 - 18 = 12
-        else:
-            default_age_idx = torch.tensor([12]).to(x.device)
-        age_emb = self.emb_age(default_age_idx).unsqueeze(-1)
-        
-        if g is not None:
-            g = g + age_emb
-        else:
-            g = age_emb
+    # 推論時の性別埋め込み
+    if gid is not None:
+        gender_emb = self.emb_gender(gid).unsqueeze(-1)
+        g = gender_emb  # 性別埋め込みのみを使用
+    elif g is None:
+        # デフォルトの性別埋め込みを使用
+        default_gid = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        gender_emb = self.emb_gender(default_gid).unsqueeze(-1)
+        g = gender_emb
 
     if self.use_sdp:
         logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
@@ -564,13 +546,23 @@ class SynthesizerTrn(nn.Module):
     o = self.dec((z * y_mask)[:,:,:max_len], g=g)
     return o, attn, y_mask, (z, z_p, m_p, logs_p)
 
-  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
+  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt, gid_src=None, gid_tgt=None):
     assert self.n_speakers > 0, "n_speakers have to be larger than 0."
+    
+    # ソース話者の埋め込み
     g_src = self.emb_g(sid_src).unsqueeze(-1)
+    if gid_src is not None:
+        gender_emb_src = self.emb_gender(gid_src).unsqueeze(-1)
+        g_src = g_src + gender_emb_src
+    
+    # ターゲット話者の埋め込み
     g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+    if gid_tgt is not None:
+        gender_emb_tgt = self.emb_gender(gid_tgt).unsqueeze(-1)
+        g_tgt = g_tgt + gender_emb_tgt
+    
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
     z_p = self.flow(z, y_mask, g=g_src)
     z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
     o_hat = self.dec(z_hat * y_mask, g=g_tgt)
     return o_hat, y_mask, (z, z_p, z_hat)
-

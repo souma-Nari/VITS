@@ -58,31 +58,26 @@ class TextAudioLoader(torch.utils.data.Dataset):
     
     def _filter(self):
 
-        audiopaths_sid_text_new = []
+        audiopaths_and_text_new = []
         lengths = []
-        for line in self.audiopaths_sid_text:
-            # 4列対応: audiopath, gender, age, text
-            if len(line) == 4:
-                audiopath, gender, age, text = line
+
+        for line in self.audiopaths_and_text:
+            # 柔軟に2列 or 3列対応
+            if len(line) == 2:
+                audiopath, text = line
             elif len(line) == 3:
-                # 従来の3列: audiopath, speaker_id, text
-                audiopath, gender, text = line
-                age = None
+                audiopath, _, text = line
             else:
-                continue
+                continue  # スキップ
 
             if self.min_text_len <= len(text) <= self.max_text_len:
-                if age is not None:
-                    audiopaths_sid_text_new.append([audiopath, gender, age, text])
-                else:
-                    audiopaths_sid_text_new.append([audiopath, gender, text])
+                audiopaths_and_text_new.append([audiopath, text])
                 try:
                     lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
                 except OSError:
-                    continue
+                    continue  # ファイルが存在しない場合などはスキップ
 
-
-        self.audiopaths_and_text = audiopaths_sid_text_new
+        self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
 
@@ -201,44 +196,40 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.add_blank = hparams.add_blank
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 190)
-        self.has_age = self._detect_age_column()
-        if self.has_age:
-            print("年齢情報が検出されました。")
 
-        random.seed(1234)
-        random.shuffle(self.audiopaths_sid_text)
+         # 性別情報の自動検出
+        self.has_gender = self._detect_gender_column()
+        if self.has_gender:
+            print("性別情報が検出されました。")
+
         self._filter()
 
-    def _detect_age_column(self):
-        """データファイルに年齢列があるかを自動検出"""
+    def _detect_gender_column(self):
+        """データファイルに性別列があるかを自動検出"""
         if len(self.audiopaths_sid_text) > 0:
             first_line = self.audiopaths_sid_text[0]
-            return len(first_line) == 4
+            return len(first_line) == 4  # ファイルパス|話者ID|性別|テキスト
         return False
-    
+
     def _filter(self):
         """
         Filter text & store spec lengths
         """
-        # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
-
         audiopaths_sid_text_new = []
         lengths = []
         for line in self.audiopaths_sid_text:
-            # 年齢情報の有無に応じて処理を分岐
-            if self.has_age and len(line) == 4:
-                audiopath, sid, age, text = line
+            # 性別情報の有無に応じて処理を分岐
+            if self.has_gender and len(line) == 4:
+                audiopath, sid, gender, text = line
             elif len(line) == 3:
                 audiopath, sid, text = line
-                age = None
+                gender = None
             else:
                 continue
 
             if self.min_text_len <= len(text) <= self.max_text_len:
-                if age is not None:
-                    audiopaths_sid_text_new.append([audiopath, sid, age, text])
+                if gender is not None:
+                    audiopaths_sid_text_new.append([audiopath, sid, gender, text])
                 else:
                     audiopaths_sid_text_new.append([audiopath, sid, text])
                 try:
@@ -250,25 +241,34 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.lengths = lengths
 
     def get_audio_text_speaker_pair(self, audiopath_sid_text):
-        # 4列の場合: audiopath, gender, age, text
-        if self.has_age and len(audiopath_sid_text) == 4:
-            audiopath, sid, age, text = audiopath_sid_text
-            age = self.get_age(age)
+        # 性別情報の有無に応じて処理を分岐
+        if self.has_gender and len(audiopath_sid_text) == 4:
+            audiopath, sid, gender, text = audiopath_sid_text
+            gender = self.get_gender(gender)
         else:
             audiopath, sid, text = audiopath_sid_text
-            age = torch.LongTensor([30])  # デフォルト30歳
+            gender = torch.LongTensor([0])  # デフォルト: 男性
             
         text = self.get_text(text)
         spec, wav = self.get_audio(audiopath)
         sid = self.get_sid(sid)
-        return (text, spec, wav, sid, age)
+        return (text, spec, wav, sid, gender)
+
+    def get_gender(self, gender):
+        """性別を数値に変換（0=男性, 1=女性）"""
+        gender_int = int(gender)
+        return torch.LongTensor([gender_int])
     
-    def get_age(self, age):
-        age_int = int(age)
-        # 年齢が範囲外の場合は適切な値にクランプ
-        age_clamped = max(18, min(80, age_int))
-        return torch.LongTensor([age_clamped])
-    
+    def get_text(self, text):
+        if self.cleaned_text:
+            text_norm = cleaned_text_to_sequence(text)
+        else:
+            text_norm = text_to_sequence(text, self.text_cleaners)
+        if self.add_blank:
+            text_norm = commons.intersperse(text_norm, 0)
+        text_norm = torch.LongTensor(text_norm)
+        return text_norm
+
     def get_audio(self, filename):
         audio, sampling_rate = load_wav_to_torch(filename)
         if sampling_rate != self.sampling_rate:
@@ -286,16 +286,6 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             spec = torch.squeeze(spec, 0)
             torch.save(spec, spec_filename)
         return spec, audio_norm
-
-    def get_text(self, text):
-        if self.cleaned_text:
-            text_norm = cleaned_text_to_sequence(text)
-        else:
-            text_norm = text_to_sequence(text, self.text_cleaners)
-        if self.add_blank:
-            text_norm = commons.intersperse(text_norm, 0)
-        text_norm = torch.LongTensor(text_norm)
-        return text_norm
 
     def get_sid(self, sid):
         sid = torch.LongTensor([int(sid)])
@@ -333,7 +323,7 @@ class TextAudioSpeakerCollate():
         spec_lengths = torch.LongTensor(len(batch))
         wav_lengths = torch.LongTensor(len(batch))
         sid = torch.LongTensor(len(batch))
-        age = torch.LongTensor(len(batch))
+        gender = torch.LongTensor(len(batch))
 
         text_padded = torch.LongTensor(len(batch), max_text_len)
         spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
@@ -358,11 +348,11 @@ class TextAudioSpeakerCollate():
             wav_lengths[i] = wav.size(1)
 
             sid[i] = row[3]
-            age[i] = row[4] if len(row) > 4 else 30
+            gender[i] = row[4] if len(row) > 4 else 0  # デフォルト: 男性
 
         if self.return_ids:
-            return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, ids_sorted_decreasing
-        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid
+            return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, gender, ids_sorted_decreasing
+        return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, gender
 
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
